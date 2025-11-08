@@ -11,6 +11,46 @@ app.use(helmet());
 app.use(cors({ origin: process.env.CORS_ORIGIN || '*' }));
 app.use(express.json());
 
+/**
+ * Compare RouterOS version strings
+ * @param {string} version1 - First version (e.g., "7.20.2")
+ * @param {string} version2 - Second version (e.g., "7.20.3")
+ * @returns {number} - Returns 1 if version1 > version2, -1 if version1 < version2, 0 if equal
+ */
+function compareRouterOSVersion(version1, version2) {
+  const v1Parts = version1.split('.').map(Number);
+  const v2Parts = version2.split('.').map(Number);
+  
+  // Pad shorter version with zeros
+  const maxLength = Math.max(v1Parts.length, v2Parts.length);
+  while (v1Parts.length < maxLength) v1Parts.push(0);
+  while (v2Parts.length < maxLength) v2Parts.push(0);
+  
+  for (let i = 0; i < maxLength; i++) {
+    if (v1Parts[i] > v2Parts[i]) return 1;
+    if (v1Parts[i] < v2Parts[i]) return -1;
+  }
+  
+  return 0;
+}
+
+/**
+ * Get the next version by incrementing the patch version
+ * @param {string} version - Version string (e.g., "7.20.2")
+ * @returns {string} - Next version (e.g., "7.20.3")
+ */
+function getNextVersion(version) {
+  const parts = version.split('.').map(Number);
+  if (parts.length >= 3) {
+    parts[2] = (parts[2] || 0) + 1;
+  } else if (parts.length === 2) {
+    parts.push(1);
+  } else {
+    parts.push(0, 1);
+  }
+  return parts.join('.');
+}
+
 async function executeRouterCommand(options) {
   const {
     host,
@@ -20,14 +60,6 @@ async function executeRouterCommand(options) {
     command = '/interface/print',
     args = []
   } = options;
-
-  console.log(`[DEBUG] Starting RouterOS command execution:`, {
-    host,
-    user,
-    port,
-    command,
-    args: args.length > 0 ? args : 'none'
-  });
 
   // Wrap the entire operation in a try-catch to handle any uncaught errors
   try {
@@ -49,14 +81,11 @@ async function executeRouterCommand(options) {
       console.warn(`[WARN] RouterOS unknown reply received:`, data);
     });
 
-    console.log(`[DEBUG] RouterOSAPI connection object created for ${host}:${port}`);
-
     try {
     console.log(`[DEBUG] Attempting to connect to ${host}:${port}...`);
     await connection.connect();
     console.log(`[DEBUG] Successfully connected to ${host}:${port}`);
     
-    console.log(`[DEBUG] Executing command: ${command} with args:`, args);
     
     // Wrap the write operation in a promise to catch all errors
     const result = await new Promise((resolve, reject) => {
@@ -89,22 +118,10 @@ async function executeRouterCommand(options) {
       }
     });
     
-    console.log(`[DEBUG] Command executed successfully, result length:`, result ? result.length : 'null');
     return result;
   } catch (error) {
-    console.error(`[ERROR] RouterOS command failed:`, {
-      host,
-      port,
-      command,
-      errorType: error.constructor.name,
-      errno: error.errno,
-      message: error.message,
-      stack: error.stack
-    });
-
     // Handle specific RouterOS API errors
     if (error.errno === 'UNKNOWNREPLY' || error.message?.includes('unknown reply')) {
-      console.warn(`[WARN] RouterOS API unknown reply for command: ${command}`, error.message);
       console.warn(`[WARN] This usually means the command is not supported or router returned unexpected data`);
       // For unknown replies, return empty array instead of throwing
       return [];
@@ -112,7 +129,6 @@ async function executeRouterCommand(options) {
     
     // Handle !empty replies specifically
     if (error.message?.includes('!empty') || error.message?.includes('Tried to process unknown reply')) {
-      console.warn(`[WARN] RouterOS returned !empty reply for command: ${command}`);
       console.warn(`[WARN] This usually means no results found or command not applicable`);
       // For !empty replies, return empty array instead of throwing
       return [];
@@ -135,7 +151,6 @@ async function executeRouterCommand(options) {
     throw error;
   } finally {
     try { 
-      console.log(`[DEBUG] Closing connection to ${host}:${port}`);
       await connection.close(); 
       console.log(`[DEBUG] Connection closed successfully`);
     } catch (closeError) {
@@ -143,13 +158,6 @@ async function executeRouterCommand(options) {
     }
   }
   } catch (outerError) {
-      console.error(`[ERROR] Outer RouterOS operation failed:`, {
-        error: outerError.message,
-        stack: outerError.stack,
-        command,
-        host,
-        port
-      });
       
       // Handle !empty and unknown reply errors at the outer level
       if (outerError.message?.includes('!empty') || 
@@ -207,6 +215,7 @@ app.get('/health', (_req, res) => {
     port: Number(process.env.SERVER_PORT || process.env.PORT) || 8080,
     backend_url: process.env.BACKEND_URL || null,
     log_level: process.env.LOG_LEVEL || 'info',
+    min_routeros_version: process.env.MIN_ROUTEROS_VERSION || '7.20.2',
     mode: 'vpn-only'
   });
 });
@@ -219,8 +228,6 @@ app.post('/api/vpn/test-connection', async (req, res) => {
     if (!host || !u || !password) {
       return res.status(400).json({ success: false, message: 'host, user/username, password are required' });
     }
-
-    console.log(`Testing VPN connection to ${host}:${port || (connection_type === 'ssh' ? 22 : 8728)} via ${connection_type || 'api'}`);
 
     if ((connection_type || 'api') === 'ssh') {
       const conn = new SSHClient();
@@ -250,7 +257,6 @@ app.post('/api/vpn/test-connection', async (req, res) => {
 
       await connectionPromise;
       conn.end();
-      console.log(`SSH connection successful to ${host}`);
       return res.json({ success: true, message: 'SSH connection successful' });
     } else {
       const data = await executeRouterCommand({
@@ -260,7 +266,6 @@ app.post('/api/vpn/test-connection', async (req, res) => {
         port: Number(port) || 8728,
         command: '/system/identity/print'
       });
-      console.log(`API connection successful to ${host}`);
       return res.json({ success: true, message: 'API connection successful', data });
     }
   } catch (error) {
@@ -297,10 +302,6 @@ app.post('/api/vpn/router-info', async (req, res) => {
 
 // Setup WireGuard VPN
 app.post('/api/vpn/setup', async (req, res) => {
-  console.log(`[DEBUG] VPN setup request received:`, {
-    body: req.body ? Object.keys(req.body) : 'no body',
-    timestamp: new Date().toISOString()
-  });
 
   try {
     const { 
@@ -311,14 +312,7 @@ app.post('/api/vpn/setup', async (req, res) => {
       port, 
       vpnConfig 
     } = req.body || {};
-    
-    console.log(`[DEBUG] Parsed request parameters:`, {
-      host,
-      user: user || username,
-      port,
-      hasPassword: !!password,
-      hasVpnConfig: !!vpnConfig
-    });
+  
     
     const u = user || username;
     if (!host || !u || !password || !vpnConfig) {
@@ -348,6 +342,45 @@ app.post('/api/vpn/setup', async (req, res) => {
         success: false, 
         message: 'vpnConfig must include server_public_key, endpoint_host, endpoint_port, and client_address' 
       });
+    }
+
+    // Step 0: Check RouterOS firmware version (must be >= 7.20.2)
+    console.log(`[DEBUG] Step 0: Checking RouterOS firmware version...`);
+    try {
+      const resource = await executeRouterCommand({
+        host,
+        user: u,
+        password,
+        port: Number(port) || 8728,
+        command: '/system/resource/print'
+      });
+
+      const routerVersion = resource?.[0]?.version || null;
+      console.log(`[DEBUG] RouterOS version detected: ${routerVersion}`);
+
+      if (!routerVersion) {
+        console.warn(`[WARN] Could not determine RouterOS version, proceeding with caution`);
+      } else {
+        const minRequiredVersion = process.env.MIN_ROUTEROS_VERSION || '7.20.2';
+        const versionComparison = compareRouterOSVersion(routerVersion, minRequiredVersion);
+        
+        // Require version >= minRequiredVersion (reject versions lower than minRequiredVersion)
+        if (versionComparison < 0) {
+          console.error(`[ERROR] RouterOS version ${routerVersion} is too old. Required: >= ${minRequiredVersion}`);
+          return res.status(400).json({
+            success: false,
+            message: `RouterOS firmware version ${routerVersion} is too old. Please update your RouterOS firmware to version ${minRequiredVersion} or higher before proceeding with VPN setup.`,
+            router_version: routerVersion,
+            required_version: `>= ${minRequiredVersion}`
+          });
+        }
+        
+        console.log(`[DEBUG] RouterOS version ${routerVersion} meets requirement (>= ${minRequiredVersion})`);
+      }
+    } catch (versionError) {
+      console.error(`[ERROR] Failed to check RouterOS version:`, versionError?.message);
+      // Don't block setup if version check fails, but log the warning
+      console.warn(`[WARN] Proceeding with VPN setup despite version check failure`);
     }
 
     const results = [];
@@ -389,47 +422,140 @@ app.post('/api/vpn/setup', async (req, res) => {
         results.push({ step: 'interface_exists', success: true, id: interfaceId });
       }
 
-      // Step 3: Add IP address to WireGuard interface
-      console.log(`[DEBUG] Step 3: Adding IP address ${client_address} to WireGuard interface...`);
-      const addressResult = await executeRouterCommand({
-        host,
-        user: u,
-        password,
-        port: Number(port) || 8728,
-        command: '/ip/address/add',
-        args: [`=address=${client_address}`, '=interface=wg_mmtech']
-      });
-      console.log(`[DEBUG] Step 3 completed. Address added with ID: ${addressResult.ret}`);
-      results.push({ step: 'add_address', success: true, id: addressResult.ret });
+      // Step 3: Add IP address to WireGuard interface (remove and recreate if exists)
+      console.log(`[DEBUG] Step 3: Configuring IP address ${client_address} on WireGuard interface...`);
+      try {
+        // Check if IP address already exists on wg_mmtech interface
+        const existingAddresses = await executeRouterCommand({
+          host,
+          user: u,
+          password,
+          port: Number(port) || 8728,
+          command: '/ip/address/print',
+          args: ['?interface=wg_mmtech']
+        });
 
-      // Step 4: Add peer configuration
-      console.log(`[DEBUG] Step 4: Adding peer configuration...`);
-      const peerArgs = [
-        '=interface=wg_mmtech',
-        `=public-key=${server_public_key}`,
-        `=endpoint-address=${endpoint_host}`,
-        `=endpoint-port=${endpoint_port}`,
-        `=allowed-address=${allowed_ips}`,
-        `=persistent-keepalive=${persistent_keepalive || 25}s`
-      ];
-      console.log(`[DEBUG] Peer args:`, peerArgs);
+        // Remove existing IP addresses on wg_mmtech interface
+        if (existingAddresses && existingAddresses.length > 0) {
+          console.log(`[DEBUG] Found ${existingAddresses.length} existing IP address(es), removing...`);
+          for (const addr of existingAddresses) {
+            try {
+              await executeRouterCommand({
+                host,
+                user: u,
+                password,
+                port: Number(port) || 8728,
+                command: '/ip/address/remove',
+                args: [`=.id=${addr['.id']}`]
+              });
+            } catch (removeError) {
+              console.warn(`[WARN] Failed to remove existing IP address:`, removeError?.message);
+            }
+          }
+        }
 
-      const peerResult = await executeRouterCommand({
-        host,
-        user: u,
-        password,
-        port: Number(port) || 8728,
-        command: '/interface/wireguard/peers/add',
-        args: peerArgs
-      });
-      console.log(`[DEBUG] Step 4 completed. Peer added with ID: ${peerResult.ret}`);
-      results.push({ step: 'add_peer', success: true, id: peerResult.ret });
+        // Add the IP address
+        const addressResult = await executeRouterCommand({
+          host,
+          user: u,
+          password,
+          port: Number(port) || 8728,
+          command: '/ip/address/add',
+          args: [`=address=${client_address}`, '=interface=wg_mmtech']
+        });
+        console.log(`[DEBUG] Step 3 completed. Address added with ID: ${addressResult.ret}`);
+        results.push({ step: 'add_address', success: true, id: addressResult.ret });
+      } catch (addressError) {
+        console.warn(`[WARN] Step 3 failed:`, addressError?.message);
+        results.push({ step: 'add_address', success: false, error: addressError?.message || 'failed' });
+      }
 
-      // Step 5: Add explicit route to the peer address
-      console.log(`[DEBUG] Step 5: Adding route to peer address...`);
+      // Step 4: Add peer configuration (remove and recreate if exists)
+      console.log(`[DEBUG] Step 4: Configuring peer...`);
+      try {
+        // Check if peer with same public key already exists
+        const existingPeers = await executeRouterCommand({
+          host,
+          user: u,
+          password,
+          port: Number(port) || 8728,
+          command: '/interface/wireguard/peers/print',
+          args: [`?public-key=${server_public_key}`]
+        });
+
+        // Remove existing peer(s) with same public key
+        if (existingPeers && existingPeers.length > 0) {
+          for (const peer of existingPeers) {
+            try {
+              await executeRouterCommand({
+                host,
+                user: u,
+                password,
+                port: Number(port) || 8728,
+                command: '/interface/wireguard/peers/remove',
+                args: [`=.id=${peer['.id']}`]
+              });
+            } catch (removeError) {
+              console.warn(`[WARN] Failed to remove existing peer:`, removeError?.message);
+            }
+          }
+        }
+
+        // Add the peer configuration
+        const peerArgs = [
+          '=interface=wg_mmtech',
+          `=public-key=${server_public_key}`,
+          `=endpoint-address=${endpoint_host}`,
+          `=endpoint-port=${endpoint_port}`,
+          `=allowed-address=${allowed_ips}`,
+          `=persistent-keepalive=${persistent_keepalive || 25}s`
+        ];
+       
+        const peerResult = await executeRouterCommand({
+          host,
+          user: u,
+          password,
+          port: Number(port) || 8728,
+          command: '/interface/wireguard/peers/add',
+          args: peerArgs
+        });
+        results.push({ step: 'add_peer', success: true, id: peerResult.ret });
+      } catch (peerError) {
+        console.warn(`[WARN] Step 4 failed:`, peerError?.message);
+        results.push({ step: 'add_peer', success: false, error: peerError?.message || 'failed' });
+      }
+
       try {
         const peerIp = (client_address || '').split('/')[0] === '10.66.0.2' ? '10.66.0.1/32' : '10.66.0.1/32';
-        console.log(`[DEBUG] Adding route for peer IP: ${peerIp}`);
+        // Check if route already exists
+        const existingRoutes = await executeRouterCommand({
+          host,
+          user: u,
+          password,
+          port: Number(port) || 8728,
+          command: '/ip/route/print',
+          args: [`?dst-address=${peerIp}`, '?gateway=wg_mmtech']
+        });
+
+        // Remove existing route(s)
+        if (existingRoutes && existingRoutes.length > 0) {
+          for (const route of existingRoutes) {
+            try {
+              await executeRouterCommand({
+                host,
+                user: u,
+                password,
+                port: Number(port) || 8728,
+                command: '/ip/route/remove',
+                args: [`=.id=${route['.id']}`]
+              });
+            } catch (removeError) {
+              console.warn(`[WARN] Failed to remove existing route:`, removeError?.message);
+            }
+          }
+        }
+
+        // Add the route
         const routeResult = await executeRouterCommand({
           host,
           user: u,
@@ -438,46 +564,62 @@ app.post('/api/vpn/setup', async (req, res) => {
           command: '/ip/route/add',
           args: [`=dst-address=${peerIp}`, '=gateway=wg_mmtech', '=comment=WG peer route']
         });
-        console.log(`[DEBUG] Step 5 completed. Route added with ID: ${routeResult.ret}`);
         results.push({ step: 'add_route', success: true, id: routeResult.ret });
       } catch (routeError) {
         console.warn(`[WARN] Step 5 failed:`, routeError?.message);
         results.push({ step: 'add_route', success: false, error: routeError?.message || 'failed' });
       }
 
-      // Step 6: Add WireGuard interface to LAN list
-      console.log(`[DEBUG] Step 6: Adding WireGuard interface to LAN list...`);
+      // Step 6: Add WireGuard interface to LAN list (skip if already exists)
       try {
-        const lanListResult = await executeRouterCommand({
+        // Check if interface is already in LAN list
+        const existingLanMembers = await executeRouterCommand({
           host,
           user: u,
           password,
           port: Number(port) || 8728,
-          command: '/interface/list/member/add',
-          args: ['=list=LAN', '=interface=wg_mmtech']
+          command: '/interface/list/member/print',
+          args: ['?list=LAN', '?interface=wg_mmtech']
         });
-        console.log(`[DEBUG] Step 6 completed. LAN list member added with ID: ${lanListResult.ret}`);
-        results.push({ step: 'add_to_lan_list', success: true, id: lanListResult.ret });
+
+        if (existingLanMembers && existingLanMembers.length > 0) {
+          results.push({ step: 'add_to_lan_list', success: true, id: existingLanMembers[0]['.id'], skipped: true });
+        } else {
+          // Add to LAN list
+          const lanListResult = await executeRouterCommand({
+            host,
+            user: u,
+            password,
+            port: Number(port) || 8728,
+            command: '/interface/list/member/add',
+            args: ['=list=LAN', '=interface=wg_mmtech']
+          });
+          results.push({ step: 'add_to_lan_list', success: true, id: lanListResult.ret });
+        }
       } catch (lanListError) {
         console.warn(`[WARN] Step 6 failed:`, lanListError?.message);
         results.push({ step: 'add_to_lan_list', success: false, error: lanListError?.message || 'failed' });
       }
 
       // Step 7: Get the router's public key
-      console.log(`[DEBUG] Step 7: Getting router's public key...`);
-      const interfaceDetails = await executeRouterCommand({
-        host,
-        user: u,
-        password,
-        port: Number(port) || 8728,
-        command: '/interface/wireguard/print',
-        args: ['?name=wg_mmtech', '=.proplist=public-key']
-      });
+      let routerPublicKey = null;
+      try {
+        const interfaceDetails = await executeRouterCommand({
+          host,
+          user: u,
+          password,
+          port: Number(port) || 8728,
+          command: '/interface/wireguard/print',
+          args: ['?name=wg_mmtech', '=.proplist=public-key']
+        });
 
-      const routerPublicKey = interfaceDetails?.[0]?.['public-key'] || null;
-      console.log(`[DEBUG] Step 7 completed. Router public key: ${routerPublicKey ? 'found' : 'not found'}`);
+        routerPublicKey = interfaceDetails?.[0]?.['public-key'] || null;
+        results.push({ step: 'get_public_key', success: true, public_key: routerPublicKey || 'not found' });
+      } catch (publicKeyError) {
+        console.warn(`[WARN] Step 7 failed:`, publicKeyError?.message);
+        results.push({ step: 'get_public_key', success: false, error: publicKeyError?.message || 'failed' });
+      }
 
-      console.log(`[DEBUG] VPN setup completed successfully for ${host}`);
       return res.json({ 
         success: true, 
         message: 'WireGuard VPN configuration completed successfully',
@@ -552,11 +694,6 @@ app.post('/api/execute', async (req, res) => {
 
 // Global error handlers
 process.on('uncaughtException', (error) => {
-  console.error(`[FATAL] Uncaught Exception:`, {
-    error: error.message,
-    stack: error.stack,
-    timestamp: new Date().toISOString()
-  });
   
   // Don't exit for RouterOS-specific errors, just log them
   if (error.message?.includes('!empty') || 
@@ -594,7 +731,5 @@ const port = process.env.SERVER_PORT || process.env.PORT || 9876;
 
 app.listen(port, host, () => {
   console.log(`MikroTik VPN Server listening on ${host}:${port}`);
-  console.log('Mode: VPN Setup Only');
-  console.log(`Log level: ${process.env.LOG_LEVEL || 'info'}`);
   console.log(`[DEBUG] Server started with comprehensive logging enabled`);
 });
