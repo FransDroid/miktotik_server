@@ -82,10 +82,16 @@ async function executeRouterCommand(options) {
     });
 
     try {
+    const isDebugMode = process.env.DEBUG_MODE === 'true';
+    
     console.log(`[DEBUG] Attempting to connect to ${host}:${port}...`);
     await connection.connect();
     console.log(`[DEBUG] Successfully connected to ${host}:${port}`);
     
+    if (isDebugMode) {
+      console.log(`[DEBUG] Executing command: ${command}`);
+      console.log(`[DEBUG] Command arguments:`, JSON.stringify(args, null, 2));
+    }
     
     // Wrap the write operation in a promise to catch all errors
     const result = await new Promise((resolve, reject) => {
@@ -98,10 +104,20 @@ async function executeRouterCommand(options) {
         connection.write(command, args)
           .then((res) => {
             clearTimeout(timeout);
+            if (isDebugMode) {
+              console.log(`[DEBUG] Command response:`, JSON.stringify(res, null, 2));
+            }
             resolve(res);
           })
           .catch((err) => {
             clearTimeout(timeout);
+            if (isDebugMode) {
+              console.log(`[DEBUG] Command error:`, {
+                message: err.message,
+                errno: err.errno,
+                stack: err.stack
+              });
+            }
             // Handle !empty and unknown reply errors gracefully
             if (err.message?.includes('!empty') || 
                 err.message?.includes('Tried to process unknown reply') ||
@@ -120,6 +136,12 @@ async function executeRouterCommand(options) {
     
     return result;
   } catch (error) {
+    // Handle connection errors by errno code (e.g., -4039 for connection refused/failed)
+    if (error.errno === -4039 || error.errno === 'ECONNREFUSED' || error.errno === 'ETIMEDOUT') {
+      console.error(`[ERROR] Connection failed to ${host}:${port} (errno: ${error.errno})`);
+      throw new Error(`Cannot connect to MikroTik router at ${host}:${port}. Please verify: 1) Router is powered on and reachable, 2) API service is enabled on the router, 3) Firewall allows connections to port ${port}, 4) Host and port are correct.`);
+    }
+    
     // Handle specific RouterOS API errors
     if (error.errno === 'UNKNOWNREPLY' || error.message?.includes('unknown reply')) {
       console.warn(`[WARN] This usually means the command is not supported or router returned unexpected data`);
@@ -134,7 +156,7 @@ async function executeRouterCommand(options) {
       return [];
     }
     
-    // Handle connection errors
+    // Handle connection timeout errors
     if (error.message && error.message.includes('timeout')) {
       console.error(`[ERROR] Connection timeout to ${host}:${port}`);
       throw new Error(`Connection timeout to ${host}:${port}. Check network connectivity and router settings.`);
@@ -158,6 +180,12 @@ async function executeRouterCommand(options) {
     }
   }
   } catch (outerError) {
+      
+      // Handle connection errors at outer level
+      if (outerError.errno === -4039 || outerError.errno === 'ECONNREFUSED' || outerError.errno === 'ETIMEDOUT') {
+        console.error(`[ERROR] Connection failed at outer level (errno: ${outerError.errno})`);
+        throw outerError; // Let inner handler's error message propagate
+      }
       
       // Handle !empty and unknown reply errors at the outer level
       if (outerError.message?.includes('!empty') || 
@@ -215,7 +243,8 @@ app.get('/health', (_req, res) => {
     port: Number(process.env.SERVER_PORT || process.env.PORT) || 8080,
     backend_url: process.env.BACKEND_URL || null,
     log_level: process.env.LOG_LEVEL || 'info',
-    min_routeros_version: process.env.MIN_ROUTEROS_VERSION || '7.20.2',
+    min_routeros_version: process.env.MIN_ROUTEROS_VERSION || '7.1',
+    debug_mode: process.env.DEBUG_MODE === 'true',
     mode: 'vpn-only'
   });
 });
@@ -359,28 +388,41 @@ app.post('/api/vpn/setup', async (req, res) => {
       console.log(`[DEBUG] RouterOS version detected: ${routerVersion}`);
 
       if (!routerVersion) {
-        console.warn(`[WARN] Could not determine RouterOS version, proceeding with caution`);
+        console.error(`[ERROR] Could not determine RouterOS version`);
+        return res.status(400).json({
+          success: false,
+          message: 'Unable to determine RouterOS version. Please ensure the router is accessible and try again.'
+        });
       } else {
-        const minRequiredVersion = process.env.MIN_ROUTEROS_VERSION || '7.20.2';
-        const versionComparison = compareRouterOSVersion(routerVersion, minRequiredVersion);
+        const minRequiredVersion = process.env.MIN_ROUTEROS_VERSION || '7.1';
+        const majorVersion = parseInt(routerVersion.split('.')[0], 10);
         
-        // Require version >= minRequiredVersion (reject versions lower than minRequiredVersion)
-        if (versionComparison < 0) {
-          console.error(`[ERROR] RouterOS version ${routerVersion} is too old. Required: >= ${minRequiredVersion}`);
+        // WireGuard requires RouterOS v7.x or higher (not available in v6.x)
+        if (majorVersion < 7) {
+          console.error(`[ERROR] RouterOS version ${routerVersion} does not support WireGuard. Required: v7.x or higher`);
           return res.status(400).json({
             success: false,
-            message: `RouterOS firmware version ${routerVersion} is too old. Please update your RouterOS firmware to version ${minRequiredVersion} or higher before proceeding with VPN setup.`,
+            message: `RouterOS firmware version ${routerVersion} does not support WireGuard. WireGuard requires RouterOS v7.1 or higher. Please upgrade your RouterOS firmware to v7.1+ before proceeding with VPN setup.`,
             router_version: routerVersion,
-            required_version: `>= ${minRequiredVersion}`
+            required_version: '>= 7.1'
           });
         }
         
-        console.log(`[DEBUG] RouterOS version ${routerVersion} meets requirement (>= ${minRequiredVersion})`);
+        // Optional: Check against specific minimum version if set (e.g., 7.20.2 for stability)
+        const versionComparison = compareRouterOSVersion(routerVersion, minRequiredVersion);
+        if (versionComparison < 0) {
+          console.warn(`[WARN] RouterOS version ${routerVersion} is below recommended version ${minRequiredVersion}, but WireGuard should still work`);
+        }
+        
+        console.log(`[DEBUG] RouterOS version ${routerVersion} supports WireGuard (v7.x detected)`);
       }
     } catch (versionError) {
       console.error(`[ERROR] Failed to check RouterOS version:`, versionError?.message);
-      // Don't block setup if version check fails, but log the warning
-      console.warn(`[WARN] Proceeding with VPN setup despite version check failure`);
+      // Block setup if we can't verify version - WireGuard only works on v7.x
+      return res.status(500).json({
+        success: false,
+        message: `Unable to verify RouterOS version: ${versionError?.message || 'Connection failed'}. WireGuard requires RouterOS v7.1 or higher. Please verify the router is accessible and running RouterOS v7.1+ before proceeding.`
+      });
     }
 
     const results = [];
@@ -732,4 +774,7 @@ const port = process.env.SERVER_PORT || process.env.PORT || 9876;
 app.listen(port, host, () => {
   console.log(`MikroTik VPN Server listening on ${host}:${port}`);
   console.log(`[DEBUG] Server started with comprehensive logging enabled`);
+  if (process.env.DEBUG_MODE === 'true') {
+    console.log(`[DEBUG] DEBUG_MODE is ENABLED - All command outputs will be logged`);
+  }
 });
